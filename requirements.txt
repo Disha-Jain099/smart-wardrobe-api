@@ -3,7 +3,7 @@ uvicorn==0.29.0
 python-multipart==0.0.9
 pydantic==2.7.1
 
-tensorflow-cpu==2.16.1
+tensorflow-cpu
 numpy==1.26.4
 
 Pillow==10.3.0
