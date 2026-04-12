@@ -30,9 +30,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_PATH  = "fashion_model.tflite"
-CLASS_NAMES = ["Bottomwear", "Dresses", "Topwear"]
-IMG_SIZE    = 224
+CLOTHING_MODEL_PATH = "fashion_model.tflite"
+FOOTWEAR_MODEL_PATH = "footwear_classifier.tflite"
+FOOTWEAR_LABELS_PATH = "labels.txt"
+CLOTHING_CLASS_NAMES = ["Bottomwear", "Dresses", "Topwear"]
+IMG_SIZE = 224
+FOOTWEAR_CATEGORY_NAME = "Footwear"
+FOOTWEAR_CONFIDENCE_THRESHOLD = 55.0
 
 MAX_BG_REMOVE_SIDE = 512
 MAX_COLOR_PIXELS = 12000
@@ -41,17 +45,44 @@ SHAPE_ANALYSIS_MAX_SIDE = 384
 MAX_RESPONSE_IMAGE_SIDE = 1024
 BG_REMOVE_TIMEOUT_SEC = 10
 ENABLE_BG_REMOVAL = False
-PIPELINE_VERSION = "2026-04-09-v5-speed"
+PIPELINE_VERSION = "2026-04-12-v6-footwear"
 
-print("Loading TFLite model...")
+print("Loading TFLite models...")
 cpu_count = os.cpu_count() or 2
-interpreter = tf.lite.Interpreter(model_path=MODEL_PATH, num_threads=max(1, min(4, cpu_count)))
-interpreter.allocate_tensors()
-_interpreter_lock = threading.Lock()
+_num_threads = max(1, min(4, cpu_count))
 
-input_details  = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
-print("TFLite Model loaded!")
+clothing_interpreter = tf.lite.Interpreter(model_path=CLOTHING_MODEL_PATH, num_threads=_num_threads)
+clothing_interpreter.allocate_tensors()
+_clothing_interpreter_lock = threading.Lock()
+clothing_input_details = clothing_interpreter.get_input_details()
+clothing_output_details = clothing_interpreter.get_output_details()
+
+
+def _load_footwear_labels(path: str) -> list[str]:
+    labels = []
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Footwear labels file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if ":" in line:
+                _, label = line.split(":", 1)
+                line = label.strip()
+            labels.append(line)
+    if not labels:
+        raise ValueError(f"No labels found in {path}")
+    return labels
+
+
+FOOTWEAR_CLASS_NAMES = _load_footwear_labels(FOOTWEAR_LABELS_PATH)
+footwear_interpreter = tf.lite.Interpreter(model_path=FOOTWEAR_MODEL_PATH, num_threads=_num_threads)
+footwear_interpreter.allocate_tensors()
+_footwear_interpreter_lock = threading.Lock()
+footwear_input_details = footwear_interpreter.get_input_details()
+footwear_output_details = footwear_interpreter.get_output_details()
+print("TFLite models loaded!")
 
 _rembg_session = None
 print("Background removal disabled.")
@@ -86,16 +117,35 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
     return labels == largest_label
 
 def predict_category(img_array: np.ndarray) -> dict:
-    with _interpreter_lock:
-        interpreter.set_tensor(input_details[0]['index'], img_array)
-        interpreter.invoke()
-        preds = interpreter.get_tensor(output_details[0]['index'])[0]
+    with _clothing_interpreter_lock:
+        clothing_interpreter.set_tensor(clothing_input_details[0]['index'], img_array)
+        clothing_interpreter.invoke()
+        preds = clothing_interpreter.get_tensor(clothing_output_details[0]['index'])[0]
     pred_idx = int(np.argmax(preds))
     return {
-        "category"   : CLASS_NAMES[pred_idx],
+        "category"   : CLOTHING_CLASS_NAMES[pred_idx],
         "confidence" : round(float(preds[pred_idx]) * 100, 2),
-        "all_scores" : {cls: round(float(p) * 100, 2) for cls, p in zip(CLASS_NAMES, preds)}
+        "all_scores" : {cls: round(float(p) * 100, 2) for cls, p in zip(CLOTHING_CLASS_NAMES, preds)}
     }
+
+
+def predict_footwear_category(img_array: np.ndarray) -> dict:
+    with _footwear_interpreter_lock:
+        footwear_interpreter.set_tensor(footwear_input_details[0]['index'], img_array)
+        footwear_interpreter.invoke()
+        preds = footwear_interpreter.get_tensor(footwear_output_details[0]['index'])[0]
+    pred_idx = int(np.argmax(preds))
+    return {
+        "category": FOOTWEAR_CLASS_NAMES[pred_idx],
+        "confidence": round(float(preds[pred_idx]) * 100, 2),
+        "all_scores": {cls: round(float(p) * 100, 2) for cls, p in zip(FOOTWEAR_CLASS_NAMES, preds)},
+    }
+
+
+def resolve_final_category(clothing_result: dict, footwear_result: dict) -> tuple[str, float]:
+    if footwear_result["confidence"] >= FOOTWEAR_CONFIDENCE_THRESHOLD:
+        return FOOTWEAR_CATEGORY_NAME, footwear_result["confidence"]
+    return clothing_result["category"], clothing_result["confidence"]
 
 def _extract_mask(img: Image.Image) -> np.ndarray:
     arr = np.array(img.convert("RGBA"))
@@ -436,7 +486,14 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": True, "pipeline_version": PIPELINE_VERSION}
+    return {
+        "status": "ok",
+        "models_loaded": {
+            "clothing": True,
+            "footwear": True,
+        },
+        "pipeline_version": PIPELINE_VERSION,
+    }
 
 @app.post("/classify")
 async def classify_with_bg_removal(file: UploadFile = File(...)):
@@ -447,12 +504,18 @@ async def classify_with_bg_removal(file: UploadFile = File(...)):
         img_input = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img_focus = img_input.convert("RGBA")
         img_array = preprocess_image(img_focus.convert("RGB"))
-        result = predict_category(img_array)
+        clothing_result = predict_category(img_array)
+        footwear_result = predict_footwear_category(img_array)
+        final_category, final_confidence = resolve_final_category(clothing_result, footwear_result)
         return {
             "success": True,
             "filename": file.filename,
-            "category": result["category"],
-            "confidence": result["confidence"],
+            "category": final_category,
+            "confidence": final_confidence,
+            "clothing_category": clothing_result["category"],
+            "clothing_confidence": clothing_result["confidence"],
+            "footwear_category": footwear_result["category"],
+            "footwear_confidence": footwear_result["confidence"],
             "bg_removed": False,
             "pipeline_version": PIPELINE_VERSION,
         }
@@ -469,8 +532,19 @@ async def classify_without_bg_removal(file: UploadFile = File(...)):
         img_bytes = await file.read()
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img_array = preprocess_image(img)
-        result = predict_category(img_array)
-        return {"success": True, "filename": file.filename, **result, "bg_removed": False, "pipeline_version": PIPELINE_VERSION}
+        clothing_result = predict_category(img_array)
+        footwear_result = predict_footwear_category(img_array)
+        final_category, final_confidence = resolve_final_category(clothing_result, footwear_result)
+        return {
+            "success": True,
+            "filename": file.filename,
+            "category": final_category,
+            "confidence": final_confidence,
+            "clothing": clothing_result,
+            "footwear": footwear_result,
+            "bg_removed": False,
+            "pipeline_version": PIPELINE_VERSION,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -481,13 +555,17 @@ async def process_clothing(request: ImageBase64Request):
         img_input = Image.open(io.BytesIO(image_data)).convert("RGB")
         img_focus = img_input.convert("RGBA")
         img_array = preprocess_image(img_focus.convert("RGB"))
-        result = predict_category(img_array)
-        final_category = result["category"]
+        clothing_result = predict_category(img_array)
+        footwear_result = predict_footwear_category(img_array)
+        final_category, final_confidence = resolve_final_category(clothing_result, footwear_result)
         loop = asyncio.get_event_loop()
         color_future = loop.run_in_executor(None, detect_color, img_focus)
         sub_type_future = None
+        footwear_type = None
         if final_category == "Bottomwear":
             sub_type_future = loop.run_in_executor(None, detect_bottomwear_type, img_focus)
+        elif final_category == FOOTWEAR_CATEGORY_NAME:
+            footwear_type = footwear_result["category"]
         detected_color = await color_future
         sub_type = None
         if sub_type_future is not None:
@@ -496,9 +574,12 @@ async def process_clothing(request: ImageBase64Request):
             "success"   : True,
             "category"  : final_category,
             "sub_type"  : sub_type,
-            "confidence": result["confidence"] / 100,
+            "footwear_type": footwear_type,
+            "confidence": round(final_confidence / 100.0, 4),
             "color"     : detected_color,
-            "all_scores": result["all_scores"],
+            "all_scores": clothing_result["all_scores"],
+            "clothing": clothing_result,
+            "footwear": footwear_result,
             "bg_removed": False,
             "pipeline_version": PIPELINE_VERSION,
         }
