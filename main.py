@@ -142,10 +142,34 @@ def predict_footwear_category(img_array: np.ndarray) -> dict:
     }
 
 
+# Configuration
+FOOTWEAR_CONFIDENCE_THRESHOLD = 55.0
+CONFIDENCE_MARGIN = 10.0  # How much better footwear must be
+
 def resolve_final_category(clothing_result: dict, footwear_result: dict) -> tuple[str, float]:
-    if footwear_result["confidence"] >= FOOTWEAR_CONFIDENCE_THRESHOLD:
-        return FOOTWEAR_CATEGORY_NAME, footwear_result["confidence"]
-    return clothing_result["category"], clothing_result["confidence"]
+    """
+    Intelligent category resolution between clothing and footwear models.
+    
+    Rules:
+    1. Footwear confidence must be >= 55%
+    2. Footwear must be at least 10% more confident than clothing
+    3. Otherwise, trust the clothing model
+    """
+    clothing_conf = clothing_result["confidence"]
+    footwear_conf = footwear_result["confidence"]
+    
+    print(f"🔍 Clothing: {clothing_result['category']} @ {clothing_conf:.1f}%")
+    print(f"🔍 Footwear: {footwear_result['category']} @ {footwear_conf:.1f}%")
+    
+    # Footwear must clearly win
+    if (footwear_conf >= FOOTWEAR_CONFIDENCE_THRESHOLD and 
+        (footwear_conf - clothing_conf) >= CONFIDENCE_MARGIN):
+        print(f"✅ Final: Footwear (margin: {footwear_conf - clothing_conf:.1f}%)")
+        return FOOTWEAR_CATEGORY_NAME, footwear_conf
+    
+    # Default to clothing
+    print(f"✅ Final: {clothing_result['category']}")
+    return clothing_result["category"], clothing_conf
 
 def _extract_mask(img: Image.Image) -> np.ndarray:
     arr = np.array(img.convert("RGBA"))
