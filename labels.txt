@@ -1,0 +1,5 @@
+0: boots
+1: heels
+2: sandals
+3: shoes
+4: slippers
