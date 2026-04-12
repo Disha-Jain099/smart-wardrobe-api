@@ -143,7 +143,7 @@ def predict_footwear_category(img_array: np.ndarray) -> dict:
 
 
 # Configuration
-FOOTWEAR_CONFIDENCE_THRESHOLD = 55.0
+FOOTWEAR_CONFIDENCE_THRESHOLD = 40.0
 CONFIDENCE_MARGIN = 10.0  # How much better footwear must be
 
 def resolve_final_category(clothing_result: dict, footwear_result: dict) -> tuple[str, float]:
