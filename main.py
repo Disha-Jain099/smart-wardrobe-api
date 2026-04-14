@@ -142,33 +142,30 @@ def predict_footwear_category(img_array: np.ndarray) -> dict:
     }
 
 
-# Configuration
-FOOTWEAR_CONFIDENCE_THRESHOLD = 40.0
-CONFIDENCE_MARGIN = 10.0  # How much better footwear must be
+FOOTWEAR_STRONG_CONF   = 85.0
+CLOTHING_OVERRIDE_CONF = 85.0
 
-def resolve_final_category(clothing_result: dict, footwear_result: dict) -> tuple[str, float]:
-    """
-    Intelligent category resolution between clothing and footwear models.
-    
-    Rules:
-    1. Footwear confidence must be >= 55%
-    2. Footwear must be at least 10% more confident than clothing
-    3. Otherwise, trust the clothing model
-    """
+def resolve_final_category(
+        clothing_result: dict, footwear_result: dict) -> tuple[str, float]:
     clothing_conf = clothing_result["confidence"]
     footwear_conf = footwear_result["confidence"]
-    
+
     print(f"🔍 Clothing: {clothing_result['category']} @ {clothing_conf:.1f}%")
     print(f"🔍 Footwear: {footwear_result['category']} @ {footwear_conf:.1f}%")
-    
-    # Footwear must clearly win
-    if (footwear_conf >= FOOTWEAR_CONFIDENCE_THRESHOLD and 
-        (footwear_conf - clothing_conf) >= CONFIDENCE_MARGIN):
-        print(f"✅ Final: Footwear (margin: {footwear_conf - clothing_conf:.1f}%)")
+
+    if footwear_conf >= FOOTWEAR_STRONG_CONF:
+        print(f"✅ Final: Footwear → {footwear_result['category']} ({footwear_conf:.1f}%)")
         return FOOTWEAR_CATEGORY_NAME, footwear_conf
-    
-    # Default to clothing
-    print(f"✅ Final: {clothing_result['category']}")
+
+    if clothing_conf >= CLOTHING_OVERRIDE_CONF:
+        print(f"✅ Final: {clothing_result['category']} — clothing dominant ({clothing_conf:.1f}%)")
+        return clothing_result["category"], clothing_conf
+
+    if footwear_conf > clothing_conf + 5.0:
+        print(f"✅ Final: Footwear → {footwear_result['category']} ({footwear_conf:.1f}%)")
+        return FOOTWEAR_CATEGORY_NAME, footwear_conf
+
+    print(f"✅ Final: {clothing_result['category']} ({clothing_conf:.1f}%)")
     return clothing_result["category"], clothing_conf
 
 def _extract_mask(img: Image.Image) -> np.ndarray:
