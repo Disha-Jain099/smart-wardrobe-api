@@ -14,12 +14,15 @@ import cv2
 from skimage import color
 from scipy.ndimage import binary_erosion
 
-# rembg disabled — dummy functions
-def remove(data, session=None):
-    return data
-
-def new_session(name):
-    return None
+try:
+    from rembg import remove, new_session
+    REMBG_AVAILABLE = True
+except Exception:
+    REMBG_AVAILABLE = False
+    def remove(data, session=None):
+        return data
+    def new_session(name):
+        return None
 
 app = FastAPI(title="Smart Wardrobe API")
 
@@ -44,8 +47,8 @@ COLOR_ANALYSIS_MAX_SIDE = 224
 SHAPE_ANALYSIS_MAX_SIDE = 384
 MAX_RESPONSE_IMAGE_SIDE = 1024
 BG_REMOVE_TIMEOUT_SEC = 10
-ENABLE_BG_REMOVAL = False
-PIPELINE_VERSION = "2026-04-12-v6-footwear"
+ENABLE_BG_REMOVAL = True
+PIPELINE_VERSION = "2026-04-30-v7-bgremove-color-safe"
 
 print("Loading TFLite models...")
 cpu_count = os.cpu_count() or 2
@@ -85,7 +88,37 @@ footwear_output_details = footwear_interpreter.get_output_details()
 print("TFLite models loaded!")
 
 _rembg_session = None
-print("Background removal disabled.")
+if ENABLE_BG_REMOVAL and REMBG_AVAILABLE:
+    try:
+        _rembg_session = new_session("u2net")
+        print("Background removal enabled with rembg (u2net).")
+    except Exception as e:
+        print(f"Background session init failed: {e}")
+        _rembg_session = None
+else:
+    print("Background removal unavailable (rembg not installed).")
+
+def _remove_background_rgba(img: Image.Image) -> Image.Image:
+    """
+    Background remove without color shift:
+    - No alpha compositing on gray/white background
+    - Keep original foreground RGB and attach generated alpha mask
+    """
+    if not ENABLE_BG_REMOVAL or not REMBG_AVAILABLE:
+        return img.convert("RGBA")
+
+    input_rgba = img.convert("RGBA")
+    input_rgb = input_rgba.convert("RGB")
+    input_bytes = io.BytesIO()
+    input_rgb.save(input_bytes, format="PNG")
+
+    out_bytes = remove(input_bytes.getvalue(), session=_rembg_session)
+    out_rgba = Image.open(io.BytesIO(out_bytes)).convert("RGBA")
+
+    src_arr = np.array(input_rgba, dtype=np.uint8)
+    mask_arr = np.array(out_rgba, dtype=np.uint8)[:, :, 3]
+    src_arr[:, :, 3] = mask_arr
+    return Image.fromarray(src_arr, mode="RGBA")
 
 def preprocess_image(img: Image.Image) -> np.ndarray:
     img = img.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
@@ -145,28 +178,34 @@ def predict_footwear_category(img_array: np.ndarray) -> dict:
 FOOTWEAR_STRONG_CONF   = 85.0
 CLOTHING_OVERRIDE_CONF = 85.0
 
-def resolve_final_category(
-        clothing_result: dict, footwear_result: dict) -> tuple[str, float]:
+def resolve_final_category(img: Image.Image, clothing_result: dict, footwear_result: dict) -> tuple[str, float]:
     clothing_conf = clothing_result["confidence"]
     footwear_conf = footwear_result["confidence"]
+    
+    # Image ki shape check karein
+    w, h = img.size
+    aspect_ratio = h / w 
 
-    print(f"🔍 Clothing: {clothing_result['category']} @ {clothing_conf:.1f}%")
-    print(f"🔍 Footwear: {footwear_result['category']} @ {footwear_conf:.1f}%")
+    # DEBUG logs (Taki aap terminal mein dekh sakein kya ho raha hai)
+    print(f"DEBUG: Footwear {footwear_conf}% | Clothing {clothing_conf}% | Aspect {aspect_ratio:.2f}")
 
-    if footwear_conf >= FOOTWEAR_STRONG_CONF:
-        print(f"✅ Final: Footwear → {footwear_result['category']} ({footwear_conf:.1f}%)")
+    # RULE 1: Agar Footwear model confident hai (>60%) AUR image tall nahi hai, 
+    # toh wo pakka Footwear hi hai.
+    if footwear_conf > 60.0 and aspect_ratio < 1.2:
         return FOOTWEAR_CATEGORY_NAME, footwear_conf
 
-    if clothing_conf >= CLOTHING_OVERRIDE_CONF:
-        print(f"✅ Final: {clothing_result['category']} — clothing dominant ({clothing_conf:.1f}%)")
-        return clothing_result["category"], clothing_conf
+    # RULE 2: Agar model confuse hai, toh shape refinement chalao
+    refined_cat = refine_category_by_shape(img, clothing_result["category"])
 
+    # RULE 3: Agar image kafi lambi hai (Pants/Dress), toh footwear ko ignore karo
+    if aspect_ratio > 1.5 and footwear_conf < 90.0:
+        return refined_cat, clothing_conf
+
+    # Default logic (Confidence based)
     if footwear_conf > clothing_conf + 5.0:
-        print(f"✅ Final: Footwear → {footwear_result['category']} ({footwear_conf:.1f}%)")
         return FOOTWEAR_CATEGORY_NAME, footwear_conf
-
-    print(f"✅ Final: {clothing_result['category']} ({clothing_conf:.1f}%)")
-    return clothing_result["category"], clothing_conf
+        
+    return refined_cat, clothing_conf
 
 def _extract_mask(img: Image.Image) -> np.ndarray:
     arr = np.array(img.convert("RGBA"))
@@ -196,54 +235,87 @@ def _crop_to_foreground(img_rgba: Image.Image, pad_ratio: float = 0.06) -> Image
     return img_rgba.crop((x0, y0, x1, y1))
 
 def _is_pants_like(mask, y_min, y_max, x_min, x_max, height, width):
-    if height < 40 or width < 20:
+    """
+    Checks if the mask shape resembles pants (connected at top, split at bottom).
+    """
+    # 1. Minimum size check - bahut choti cheez pants nahi ho sakti
+    if height < 50 or width < 30:
         return False
-    lower_start = y_min + int(height * 0.48)
-    lower_end = y_min + int(height * 0.97)
+
+    # --- STEP 1: WAIST CONNECTIVITY CHECK (Fix for Footwear confusion) ---
+    # Hum top 20% area check karenge. Agar ye pants hain, toh waist ek single piece honi chahiye.
+    # Agar upar hi do alag blobs hain, toh wo pakka footwear ya kuch aur hai.
+    waist_h = int(height * 0.2)
+    waist_zone = mask[y_min:y_min + waist_h, x_min:x_max + 1].astype(np.uint8)
+    
+    # connectedComponents returns (num_labels, labels)
+    num_labels, _ = cv2.connectedComponents(waist_zone, connectivity=8)
+    
+    # num_labels mein background bhi counted hota hai (label 0). 
+    # Agar 1 se zyada object pieces hain (num_labels > 2), toh ye pants nahi hain.
+    if num_labels > 2:
+        return False
+
+    # --- STEP 2: LEG DETECTION (Lower half check) ---
+    # Hum niche ke 50% area mein do "legs" dhundhenge
+    lower_start = y_min + int(height * 0.50)
+    lower_end = y_min + int(height * 0.95)
+    
     if lower_end <= lower_start:
         return False
+        
     roi = mask[lower_start:lower_end, x_min:x_max + 1]
     if roi.size == 0:
         return False
-    min_leg_width = max(3, int(width * 0.10))
-    min_gap = max(2, int(width * 0.05))
+
+    # Parameters for leg detection
+    min_leg_width = max(4, int(width * 0.12))
+    min_gap = max(3, int(width * 0.08))
+    
     rows_with_two_legs = 0
     valid_rows = 0
-    for row in roi[::2]:
+    
+    # Har dusri row check karo speed ke liye
+    for row in roi[::3]:
         cols = np.where(row > 0)[0]
-        if cols.size < min_leg_width * 2:
+        if cols.size < (min_leg_width * 2):
             continue
+            
         valid_rows += 1
+        # Find gaps between pixels in the row
         splits = np.where(np.diff(cols) > 1)[0]
         starts = np.r_[0, splits + 1]
         ends = np.r_[splits, cols.size - 1]
+        
         runs = []
         for s_idx, e_idx in zip(starts, ends):
-            run_start = cols[s_idx]
-            run_end = cols[e_idx]
-            run_w = run_end - run_start + 1
+            run_w = cols[e_idx] - cols[s_idx] + 1
             if run_w >= min_leg_width:
-                runs.append((run_start, run_end))
-        if len(runs) < 2:
-            continue
-        runs = sorted(runs, key=lambda r: (r[1] - r[0]), reverse=True)[:2]
-        left, right = sorted(runs, key=lambda r: r[0])
-        gap = right[0] - left[1] - 1
-        if gap >= min_gap:
-            rows_with_two_legs += 1
+                runs.append((cols[s_idx], cols[e_idx]))
+        
+        if len(runs) >= 2:
+            # Sort by width and take two largest
+            runs = sorted(runs, key=lambda r: (r[1] - r[0]), reverse=True)[:2]
+            # Sort by position to find gap
+            left, right = sorted(runs, key=lambda r: r[0])
+            gap = right[0] - left[1]
+            if gap >= min_gap:
+                rows_with_two_legs += 1
+
     if valid_rows == 0:
         return False
+
+    # Ratio check: Kitni rows mein do legs dikhi?
     two_leg_ratio = rows_with_two_legs / valid_rows
-    roi_main = _largest_component(roi)
-    if np.count_nonzero(roi_main) == 0:
-        return False
-    area_threshold = roi.shape[0] * roi.shape[1] * 0.04
-    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(roi.astype(np.uint8), connectivity=8)
-    if num_labels <= 1:
-        return False
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    strong_components = int(np.sum(areas >= area_threshold))
-    return two_leg_ratio > 0.28 and strong_components >= 2
+    
+    # Final check: Components in the ROI
+    num_labels_roi, _, stats, _ = cv2.connectedComponentsWithStats(roi.astype(np.uint8), connectivity=8)
+    # Area threshold to ignore tiny noise
+    area_thresh = roi.size * 0.05
+    strong_components = np.sum(stats[1:, cv2.CC_STAT_AREA] >= area_thresh)
+
+    # Logic: Agar two_leg_ratio accha hai AUR niche do alag blobs hain
+    return (two_leg_ratio > 0.30) and (strong_components >= 2)
 
 def _has_bottomwear_profile(mask, y_min, y_max, x_min, x_max):
     roi = mask[y_min:y_max + 1, x_min:x_max + 1]
@@ -401,101 +473,124 @@ def detect_bottomwear_type(img: Image.Image) -> str:
         return "Unknown"
 
 def detect_color(img: Image.Image) -> str:
+    """
+    Improved color detection with center-weighting to ignore background noise.
+    """
     try:
+        # 1. Downscale for performance
         img = _downscale_for_speed(img, COLOR_ANALYSIS_MAX_SIDE)
+        w, h = img.size
         arr = np.array(img.convert("RGBA"))
+        
+        # 2. Smart Masking Logic
         alpha = arr[:, :, 3]
         transparent_ratio = float(np.mean(alpha < 250))
-        opaque_ratio = float(np.mean(alpha > 250))
-        has_meaningful_alpha = transparent_ratio > 0.01 and opaque_ratio > 0.01
-        if has_meaningful_alpha:
+        
+        if transparent_ratio > 0.05:
+            # If we have a transparent background, use alpha
             mask = alpha > 180
         else:
-            hsv_full = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2HSV)
-            sat = hsv_full[:, :, 1].astype(np.float32) / 255.0
-            val = hsv_full[:, :, 2].astype(np.float32) / 255.0
-            bg_like = (sat < 0.12) & (val > 0.88)
-            mask = ~bg_like
-            if np.count_nonzero(mask) < 100:
-                mask = np.ones((arr.shape[0], arr.shape[1]), dtype=bool)
-        if np.count_nonzero(mask) < 100:
+            # If no transparency, focus on the CENTER (middle 60% area)
+            # This ignores walls/floors that usually occupy the edges
+            margin_x = int(w * 0.2)
+            margin_y = int(h * 0.2)
+            mask = np.zeros((h, w), dtype=bool)
+            mask[margin_y:h-margin_y, margin_x:w-margin_x] = True
+            
+            # Refine: Ignore very bright (white-ish) backgrounds within that center
+            hsv_center = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2HSV)
+            sat = hsv_center[:, :, 1].astype(np.float32) / 255.0
+            val = hsv_center[:, :, 2].astype(np.float32) / 255.0
+            not_bg = ~((sat < 0.1) & (val > 0.9)) # Ignore high brightness + low saturation
+            mask = mask & not_bg
+
+        if np.count_nonzero(mask) < 50:
             return "Unknown"
+
+        # 3. Erosion to remove "edge bleed" from background
         eroded = binary_erosion(mask, iterations=3)
         working_mask = eroded if np.count_nonzero(eroded) > 100 else mask
+        
+        # 4. Pixel Extraction & Sampling
         pixels = arr[working_mask][:, :3].astype(np.float32)
         if len(pixels) > MAX_COLOR_PIXELS:
             rng = np.random.default_rng(42)
             idx = rng.choice(len(pixels), size=MAX_COLOR_PIXELS, replace=False)
             pixels = pixels[idx]
-        if len(pixels) < 50:
-            return "Unknown"
+
+        # 5. Convert to HSV for robust analysis
         pixels_u8 = pixels.astype(np.uint8).reshape(-1, 1, 3)
         hsv_all = cv2.cvtColor(pixels_u8, cv2.COLOR_RGB2HSV).reshape(-1, 3).astype(np.float32)
-        hue = (hsv_all[:, 0] * 2.0)
+        
+        hue = hsv_all[:, 0] * 2.0  # Scale to 0-360
         sat = hsv_all[:, 1] / 255.0
         val = hsv_all[:, 2] / 255.0
-        achromatic_mask = sat < 0.15
-        chromatic_mask  = ~achromatic_mask
-        chromatic_count = np.count_nonzero(chromatic_mask)
-        achromatic_count = np.count_nonzero(achromatic_mask)
-        total = len(pixels)
-        if achromatic_count > chromatic_count:
+
+        # 6. Separate Achromatic (Black/White/Gray) from Chromatic
+        achromatic_mask = (sat < 0.15) | (val < 0.15)
+        chromatic_mask = ~achromatic_mask
+        
+        chrom_count = np.count_nonzero(chromatic_mask)
+        achrom_count = np.count_nonzero(achromatic_mask)
+
+        # 7. Decision Logic
+        if achrom_count > chrom_count * 1.5:
             avg_val = float(np.median(val[achromatic_mask]))
-            if avg_val < 0.20:
-                return "Black"
-            elif avg_val < 0.40:
-                return "Charcoal"
-            elif avg_val < 0.65:
-                return "Gray"
-            elif avg_val < 0.85:
-                return "Light Gray"
-            else:
-                return "White"
+            if avg_val < 0.20: return "Black"
+            if avg_val < 0.45: return "Charcoal"
+            if avg_val < 0.75: return "Gray"
+            if avg_val < 0.90: return "Light Gray"
+            return "White"
+
+        # Handle Chromatic Colors
         c_hue = hue[chromatic_mask]
         c_sat = sat[chromatic_mask]
         c_val = val[chromatic_mask]
+        
+        # Weighted Median Hue
         sorted_idx = np.argsort(c_hue)
-        weights = c_sat ** 2
+        weights = (c_sat ** 2) * c_val # Prioritize vivid/bright pixels
         cumulative = np.cumsum(weights[sorted_idx])
         median_idx = np.searchsorted(cumulative, cumulative[-1] / 2)
-        dominant_hue = float(c_hue[sorted_idx[median_idx]])
+        dom_hue = float(c_hue[sorted_idx[median_idx]])
+        
         avg_sat = float(np.median(c_sat))
         avg_val = float(np.median(c_val))
 
-        def hue_to_color(h, s, v):
-            if h < 12 or h >= 348:
+        # 8. Hue Mapping
+        def hue_to_name(h, s, v):
+            if h < 15 or h >= 345:
                 return "Pink" if s < 0.4 else ("Maroon" if v < 0.4 else "Red")
-            if 12 <= h < 30:
-                return "Brown" if v < 0.35 else ("Beige" if s < 0.5 else "Orange")
-            if 30 <= h < 65:
-                return "Mustard" if v < 0.55 else ("Beige" if s < 0.5 else "Yellow")
-            if 65 <= h < 85:
-                return "Olive" if v < 0.5 else "Yellow"
-            if 85 <= h < 150:
-                return "Olive" if v < 0.35 else ("Sage" if s < 0.35 else "Green")
-            if 150 <= h < 195:
-                return "Teal"
-            if 195 <= h < 255:
-                return "Navy" if v < 0.35 else ("Light Blue" if s < 0.4 else "Blue")
-            if 255 <= h < 290:
-                return "Lavender" if s < 0.4 else "Purple"
-            if 290 <= h < 330:
-                return "Burgundy" if v < 0.45 else ("Pink" if s < 0.5 else "Hot Pink")
-            if 330 <= h < 348:
+            if 15 <= h < 45:
+                return "Brown" if v < 0.4 else ("Beige" if s < 0.4 else "Orange")
+            if 45 <= h < 70:
+                return "Mustard" if v < 0.6 else ("Beige" if s < 0.3 else "Yellow")
+            if 70 <= h < 160:
+                return "Olive" if v < 0.4 else ("Sage" if s < 0.4 else "Green")
+            if 160 <= h < 200:
+                return "Teal" if v < 0.5 else "Cyan"
+            if 200 <= h < 260:
+                return "Navy" if v < 0.4 else ("Light Blue" if s < 0.4 else "Blue")
+            if 260 <= h < 300:
+                return "Purple"
+            if 300 <= h < 345:
                 return "Burgundy" if v < 0.4 else "Pink"
             return "Other"
 
-        detected = hue_to_color(dominant_hue, avg_sat, avg_val)
+        detected = hue_to_name(dom_hue, avg_sat, avg_val)
+
+        # 9. Multicolor Check (Circular Variance)
         hue_rad = np.deg2rad(c_hue)
         mean_sin = np.mean(np.sin(hue_rad))
         mean_cos = np.mean(np.cos(hue_rad))
-        circular_std = np.sqrt(-2 * np.log(np.sqrt(mean_sin**2 + mean_cos**2)))
-        circular_std_deg = np.rad2deg(circular_std)
-        if circular_std_deg > 60 and chromatic_count / total > 0.4:
+        circular_std = np.rad2deg(np.sqrt(-2 * np.log(np.sqrt(mean_sin**2 + mean_cos**2))))
+        
+        if circular_std > 55 and (chrom_count / len(pixels)) > 0.4:
             return "Multicolor"
+
         return detected
     except Exception as e:
-        print("Color error:", e)
+        print(f"Color Analysis Error: {e}")
         return "Unknown"
 
 class ImageBase64Request(BaseModel):
@@ -527,7 +622,7 @@ async def classify_with_bg_removal(file: UploadFile = File(...)):
         img_array = preprocess_image(img_focus.convert("RGB"))
         clothing_result = predict_category(img_array)
         footwear_result = predict_footwear_category(img_array)
-        final_category, final_confidence = resolve_final_category(clothing_result, footwear_result)
+        final_category, final_confidence = resolve_final_category(img_focus, clothing_result, footwear_result)
         return {
             "success": True,
             "filename": file.filename,
@@ -555,7 +650,7 @@ async def classify_without_bg_removal(file: UploadFile = File(...)):
         img_array = preprocess_image(img)
         clothing_result = predict_category(img_array)
         footwear_result = predict_footwear_category(img_array)
-        final_category, final_confidence = resolve_final_category(clothing_result, footwear_result)
+        final_category, final_confidence = resolve_final_category(img, clothing_result, footwear_result)
         return {
             "success": True,
             "filename": file.filename,
@@ -578,7 +673,7 @@ async def process_clothing(request: ImageBase64Request):
         img_array = preprocess_image(img_focus.convert("RGB"))
         clothing_result = predict_category(img_array)
         footwear_result = predict_footwear_category(img_array)
-        final_category, final_confidence = resolve_final_category(clothing_result, footwear_result)
+        final_category, final_confidence = resolve_final_category(img_focus, clothing_result, footwear_result)
         loop = asyncio.get_event_loop()
         color_future = loop.run_in_executor(None, detect_color, img_focus)
         sub_type_future = None
@@ -612,17 +707,15 @@ async def remove_bg_base64(request: ImageBase64Request):
     try:
         image_data = base64.b64decode(request.image)
         img_input = Image.open(io.BytesIO(image_data)).convert("RGB")
-        fg_img = img_input.convert("RGBA")
-        grey_bg = Image.new("RGBA", fg_img.size, (176, 176, 176, 255))
-        composite = Image.alpha_composite(grey_bg, fg_img)
-        final_img = _downscale_for_speed(composite.convert("RGB"), MAX_RESPONSE_IMAGE_SIDE)
+        fg_img = _remove_background_rgba(img_input)
+        final_img = _downscale_for_speed(fg_img, MAX_RESPONSE_IMAGE_SIDE)
         buffer = io.BytesIO()
         final_img.save(buffer, format="PNG")
         processed_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
         return {
             "success": True,
             "processed_image": processed_base64,
-            "bg_removed": False,
+            "bg_removed": ENABLE_BG_REMOVAL and REMBG_AVAILABLE,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

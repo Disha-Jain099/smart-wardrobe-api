@@ -1,12 +1,15 @@
 fastapi==0.111.0
-uvicorn==0.29.0
+uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 pydantic==2.7.1
 
-tensorflow-cpu
+tensorflow-cpu==2.15.0
 numpy==1.26.4
 
 Pillow==10.3.0
 opencv-python-headless==4.9.0.80
 scikit-image==0.23.2
 scipy==1.13.0
+
+rembg==2.0.56
+onnxruntime==1.17.3
