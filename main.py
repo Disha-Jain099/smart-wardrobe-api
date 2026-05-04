@@ -14,15 +14,12 @@ import cv2
 from skimage import color
 from scipy.ndimage import binary_erosion
 
-try:
-    from rembg import remove, new_session
-    REMBG_AVAILABLE = True
-except Exception:
-    REMBG_AVAILABLE = False
-    def remove(data, session=None):
-        return data
-    def new_session(name):
-        return None
+# rembg disabled — dummy functions
+def remove(data, session=None):
+    return data
+
+def new_session(name):
+    return None
 
 app = FastAPI(title="Smart Wardrobe API")
 
@@ -47,8 +44,8 @@ COLOR_ANALYSIS_MAX_SIDE = 224
 SHAPE_ANALYSIS_MAX_SIDE = 384
 MAX_RESPONSE_IMAGE_SIDE = 1024
 BG_REMOVE_TIMEOUT_SEC = 10
-ENABLE_BG_REMOVAL = True
-PIPELINE_VERSION = "2026-04-30-v7-bgremove-color-safe"
+ENABLE_BG_REMOVAL = False
+PIPELINE_VERSION = "2026-04-12-v6-footwear"
 
 print("Loading TFLite models...")
 cpu_count = os.cpu_count() or 2
@@ -88,37 +85,7 @@ footwear_output_details = footwear_interpreter.get_output_details()
 print("TFLite models loaded!")
 
 _rembg_session = None
-if ENABLE_BG_REMOVAL and REMBG_AVAILABLE:
-    try:
-        _rembg_session = new_session("u2net")
-        print("Background removal enabled with rembg (u2net).")
-    except Exception as e:
-        print(f"Background session init failed: {e}")
-        _rembg_session = None
-else:
-    print("Background removal unavailable (rembg not installed).")
-
-def _remove_background_rgba(img: Image.Image) -> Image.Image:
-    """
-    Background remove without color shift:
-    - No alpha compositing on gray/white background
-    - Keep original foreground RGB and attach generated alpha mask
-    """
-    if not ENABLE_BG_REMOVAL or not REMBG_AVAILABLE:
-        return img.convert("RGBA")
-
-    input_rgba = img.convert("RGBA")
-    input_rgb = input_rgba.convert("RGB")
-    input_bytes = io.BytesIO()
-    input_rgb.save(input_bytes, format="PNG")
-
-    out_bytes = remove(input_bytes.getvalue(), session=_rembg_session)
-    out_rgba = Image.open(io.BytesIO(out_bytes)).convert("RGBA")
-
-    src_arr = np.array(input_rgba, dtype=np.uint8)
-    mask_arr = np.array(out_rgba, dtype=np.uint8)[:, :, 3]
-    src_arr[:, :, 3] = mask_arr
-    return Image.fromarray(src_arr, mode="RGBA")
+print("Background removal disabled.")
 
 def preprocess_image(img: Image.Image) -> np.ndarray:
     img = img.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
@@ -622,7 +589,7 @@ async def classify_with_bg_removal(file: UploadFile = File(...)):
         img_array = preprocess_image(img_focus.convert("RGB"))
         clothing_result = predict_category(img_array)
         footwear_result = predict_footwear_category(img_array)
-        final_category, final_confidence = resolve_final_category(img_focus, clothing_result, footwear_result)
+        final_category, final_confidence = resolve_final_category(clothing_result, footwear_result)
         return {
             "success": True,
             "filename": file.filename,
@@ -650,7 +617,7 @@ async def classify_without_bg_removal(file: UploadFile = File(...)):
         img_array = preprocess_image(img)
         clothing_result = predict_category(img_array)
         footwear_result = predict_footwear_category(img_array)
-        final_category, final_confidence = resolve_final_category(img, clothing_result, footwear_result)
+        final_category, final_confidence = resolve_final_category(clothing_result, footwear_result)
         return {
             "success": True,
             "filename": file.filename,
@@ -673,7 +640,7 @@ async def process_clothing(request: ImageBase64Request):
         img_array = preprocess_image(img_focus.convert("RGB"))
         clothing_result = predict_category(img_array)
         footwear_result = predict_footwear_category(img_array)
-        final_category, final_confidence = resolve_final_category(img_focus, clothing_result, footwear_result)
+        final_category, final_confidence = resolve_final_category(clothing_result, footwear_result)
         loop = asyncio.get_event_loop()
         color_future = loop.run_in_executor(None, detect_color, img_focus)
         sub_type_future = None
@@ -707,20 +674,20 @@ async def remove_bg_base64(request: ImageBase64Request):
     try:
         image_data = base64.b64decode(request.image)
         img_input = Image.open(io.BytesIO(image_data)).convert("RGB")
-        fg_img = _remove_background_rgba(img_input)
-        final_img = _downscale_for_speed(fg_img, MAX_RESPONSE_IMAGE_SIDE)
+        fg_img = img_input.convert("RGBA")
+        grey_bg = Image.new("RGBA", fg_img.size, (176, 176, 176, 255))
+        composite = Image.alpha_composite(grey_bg, fg_img)
+        final_img = _downscale_for_speed(composite.convert("RGB"), MAX_RESPONSE_IMAGE_SIDE)
         buffer = io.BytesIO()
         final_img.save(buffer, format="PNG")
         processed_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
         return {
             "success": True,
             "processed_image": processed_base64,
-            "bg_removed": ENABLE_BG_REMOVAL and REMBG_AVAILABLE,
+            "bg_removed": False,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    import os
-    port = int(os.getenv("PORT", 8080))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
