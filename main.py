@@ -12,9 +12,9 @@ import uvicorn
 import cv2
 
 try:
-    from tflite_runtime.interpreter import Interpreter
-except ImportError:
     from tensorflow.lite import Interpreter
+except ImportError:
+    from tflite_runtime.interpreter import Interpreter
 
 app = FastAPI(title="Smart Wardrobe API")
 
