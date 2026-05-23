@@ -3,7 +3,7 @@ uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 pydantic==2.7.1
 
-tensorflow-cpu==2.16.1
+tensorflow-cpu==2.19.0
 numpy==1.26.4
 
 

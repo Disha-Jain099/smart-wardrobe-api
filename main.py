@@ -53,11 +53,17 @@ print("Loading TFLite models...")
 cpu_count = os.cpu_count() or 2
 _num_threads = max(1, min(4, cpu_count))
 
-clothing_interpreter = Interpreter(model_path=CLOTHING_MODEL_PATH, num_threads=_num_threads)
-clothing_interpreter.allocate_tensors()
-_clothing_interpreter_lock = threading.Lock()
-clothing_input_details = clothing_interpreter.get_input_details()
-clothing_output_details = clothing_interpreter.get_output_details()
+try:
+    clothing_interpreter = Interpreter(model_path=CLOTHING_MODEL_PATH, num_threads=_num_threads)
+    clothing_interpreter.allocate_tensors()
+    _clothing_interpreter_lock = threading.Lock()
+    clothing_input_details = clothing_interpreter.get_input_details()
+    clothing_output_details = clothing_interpreter.get_output_details()
+except Exception as e:
+    raise RuntimeError(
+        f"Failed to load clothing model '{CLOTHING_MODEL_PATH}'. "
+        "Model was likely exported with newer TFLite ops than current runtime supports."
+    ) from e
 
 
 def _load_footwear_labels(path: str) -> list[str]:
@@ -79,11 +85,17 @@ def _load_footwear_labels(path: str) -> list[str]:
 
 
 FOOTWEAR_CLASS_NAMES = _load_footwear_labels(FOOTWEAR_LABELS_PATH)
-footwear_interpreter = Interpreter(model_path=FOOTWEAR_MODEL_PATH, num_threads=_num_threads)
-footwear_interpreter.allocate_tensors()
-_footwear_interpreter_lock = threading.Lock()
-footwear_input_details = footwear_interpreter.get_input_details()
-footwear_output_details = footwear_interpreter.get_output_details()
+try:
+    footwear_interpreter = Interpreter(model_path=FOOTWEAR_MODEL_PATH, num_threads=_num_threads)
+    footwear_interpreter.allocate_tensors()
+    _footwear_interpreter_lock = threading.Lock()
+    footwear_input_details = footwear_interpreter.get_input_details()
+    footwear_output_details = footwear_interpreter.get_output_details()
+except Exception as e:
+    raise RuntimeError(
+        f"Failed to load footwear model '{FOOTWEAR_MODEL_PATH}'. "
+        "Model was likely exported with newer TFLite ops than current runtime supports."
+    ) from e
 print("TFLite models loaded!")
 
 _rembg_session = None
