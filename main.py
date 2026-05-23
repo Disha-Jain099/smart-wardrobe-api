@@ -12,12 +12,16 @@ import uvicorn
 import cv2
 
 try:
-    from tensorflow.lite import Interpreter
-except Exception as e:
-    raise RuntimeError(
-        "TensorFlow Lite interpreter not available. Install `tensorflow-cpu==2.16.1` "
-        "and redeploy with cleared build cache."
-    ) from e
+    import tensorflow as tf
+    Interpreter = tf.lite.Interpreter
+except Exception:
+    try:
+        from tflite_runtime.interpreter import Interpreter
+    except Exception as e:
+        raise RuntimeError(
+            "TFLite interpreter not available. Install `tensorflow-cpu==2.16.1` "
+            "or `tflite-runtime` and redeploy."
+        ) from e
 
 app = FastAPI(title="Smart Wardrobe API")
 
