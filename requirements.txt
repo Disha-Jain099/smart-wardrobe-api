@@ -3,10 +3,8 @@ uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 pydantic==2.7.1
 
-tensorflow-cpu==2.16.1
+tflite-runtime==2.14.0
 numpy==1.26.4
 
 Pillow==10.3.0
 opencv-python-headless==4.9.0.80
-scikit-image==0.23.2
-scipy==1.13.0

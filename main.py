@@ -1,4 +1,3 @@
-﻿import tensorflow as tf
 import numpy as np
 from PIL import Image
 import io
@@ -11,15 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import cv2
-from skimage import color
-from scipy.ndimage import binary_erosion
 
-# rembg disabled — dummy functions
-def remove(data, session=None):
-    return data
-
-def new_session(name):
-    return None
+try:
+    from tflite_runtime.interpreter import Interpreter
+except ImportError:
+    from tensorflow.lite import Interpreter
 
 app = FastAPI(title="Smart Wardrobe API")
 
@@ -44,14 +39,14 @@ COLOR_ANALYSIS_MAX_SIDE = 224
 SHAPE_ANALYSIS_MAX_SIDE = 384
 MAX_RESPONSE_IMAGE_SIDE = 1024
 BG_REMOVE_TIMEOUT_SEC = 10
-ENABLE_BG_REMOVAL = False
+ENABLE_BG_REMOVAL = os.getenv("ENABLE_BG_REMOVAL", "false").lower() == "true"
 PIPELINE_VERSION = "2026-04-12-v6-footwear"
 
 print("Loading TFLite models...")
 cpu_count = os.cpu_count() or 2
 _num_threads = max(1, min(4, cpu_count))
 
-clothing_interpreter = tf.lite.Interpreter(model_path=CLOTHING_MODEL_PATH, num_threads=_num_threads)
+clothing_interpreter = Interpreter(model_path=CLOTHING_MODEL_PATH, num_threads=_num_threads)
 clothing_interpreter.allocate_tensors()
 _clothing_interpreter_lock = threading.Lock()
 clothing_input_details = clothing_interpreter.get_input_details()
@@ -77,7 +72,7 @@ def _load_footwear_labels(path: str) -> list[str]:
 
 
 FOOTWEAR_CLASS_NAMES = _load_footwear_labels(FOOTWEAR_LABELS_PATH)
-footwear_interpreter = tf.lite.Interpreter(model_path=FOOTWEAR_MODEL_PATH, num_threads=_num_threads)
+footwear_interpreter = Interpreter(model_path=FOOTWEAR_MODEL_PATH, num_threads=_num_threads)
 footwear_interpreter.allocate_tensors()
 _footwear_interpreter_lock = threading.Lock()
 footwear_input_details = footwear_interpreter.get_input_details()
@@ -85,13 +80,26 @@ footwear_output_details = footwear_interpreter.get_output_details()
 print("TFLite models loaded!")
 
 _rembg_session = None
-print("Background removal disabled.")
+_rembg_remove = None
+
+if ENABLE_BG_REMOVAL:
+    try:
+        from rembg import remove as _rembg_remove_fn, new_session as _rembg_new_session
+
+        _rembg_session = _rembg_new_session("u2netp")
+        _rembg_remove = _rembg_remove_fn
+        print("Background removal enabled with rembg.")
+    except Exception as e:
+        ENABLE_BG_REMOVAL = False
+        print(f"Background removal disabled (rembg unavailable): {e}")
+else:
+    print("Background removal disabled by config.")
 
 def preprocess_image(img: Image.Image) -> np.ndarray:
     img = img.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
     img_array = np.array(img, dtype=np.float32)
     img_array = np.expand_dims(img_array, axis=0)
-    img_array = tf.keras.applications.efficientnet.preprocess_input(img_array)
+    img_array = (img_array / 127.5) - 1.0
     return img_array
 
 def _get_lanczos():
@@ -115,6 +123,39 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
         return mask.astype(bool)
     largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
     return labels == largest_label
+
+def _fallback_remove_background(img_rgb: Image.Image) -> Image.Image:
+    arr = np.array(img_rgb.convert("RGB"))
+    h, w = arr.shape[:2]
+    if h < 10 or w < 10:
+        return img_rgb.convert("RGBA")
+    mask = np.zeros((h, w), np.uint8)
+    rect = (max(1, int(w * 0.05)), max(1, int(h * 0.05)), max(2, int(w * 0.90)), max(2, int(h * 0.90)))
+    bg_model = np.zeros((1, 65), np.float64)
+    fg_model = np.zeros((1, 65), np.float64)
+    try:
+        cv2.grabCut(arr, mask, rect, bg_model, fg_model, 3, cv2.GC_INIT_WITH_RECT)
+        fg = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    except Exception:
+        fg = np.full((h, w), 255, dtype=np.uint8)
+    rgba = np.dstack([arr, fg])
+    return Image.fromarray(rgba, "RGBA")
+
+
+def remove_background_image(img_rgb: Image.Image) -> tuple[Image.Image, bool]:
+    if ENABLE_BG_REMOVAL and _rembg_remove is not None and _rembg_session is not None:
+        try:
+            img_small = _downscale_for_speed(img_rgb, MAX_BG_REMOVE_SIDE)
+            out = _rembg_remove(img_small, session=_rembg_session)
+            if isinstance(out, bytes):
+                rgba = Image.open(io.BytesIO(out)).convert("RGBA")
+            else:
+                rgba = out.convert("RGBA")
+            return rgba, True
+        except Exception as e:
+            print(f"rembg error, using fallback: {e}")
+    return _fallback_remove_background(img_rgb), False
+
 
 def predict_category(img_array: np.ndarray) -> dict:
     with _clothing_interpreter_lock:
@@ -371,7 +412,10 @@ def detect_bottomwear_type(img: Image.Image) -> str:
             mask = alpha > 50
         else:
             rgb_norm_full = arr[:, :, :3].astype(np.float32) / 255.0
-            hsv_full = color.rgb2hsv(rgb_norm_full)
+            hsv_full = cv2.cvtColor((rgb_norm_full * 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+            hsv_full[:, :, 0] = hsv_full[:, :, 0] / 179.0
+            hsv_full[:, :, 1] = hsv_full[:, :, 1] / 255.0
+            hsv_full[:, :, 2] = hsv_full[:, :, 2] / 255.0
             bg_like = (hsv_full[:, :, 1] < 0.12) & (hsv_full[:, :, 2] > 0.88)
             mask = ~bg_like
             if np.count_nonzero(mask) < 100:
@@ -475,7 +519,7 @@ def detect_color(img: Image.Image) -> str:
             return "Unknown"
 
         # 3. Erosion to remove "edge bleed" from background
-        eroded = binary_erosion(mask, iterations=3)
+        eroded = cv2.erode(mask.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=3).astype(bool)
         working_mask = eroded if np.count_nonzero(eroded) > 100 else mask
         
         # 4. Pixel Extraction & Sampling
@@ -589,7 +633,7 @@ async def classify_with_bg_removal(file: UploadFile = File(...)):
         img_array = preprocess_image(img_focus.convert("RGB"))
         clothing_result = predict_category(img_array)
         footwear_result = predict_footwear_category(img_array)
-        final_category, final_confidence = resolve_final_category(clothing_result, footwear_result)
+        final_category, final_confidence = resolve_final_category(img_focus, clothing_result, footwear_result)
         return {
             "success": True,
             "filename": file.filename,
@@ -617,7 +661,7 @@ async def classify_without_bg_removal(file: UploadFile = File(...)):
         img_array = preprocess_image(img)
         clothing_result = predict_category(img_array)
         footwear_result = predict_footwear_category(img_array)
-        final_category, final_confidence = resolve_final_category(clothing_result, footwear_result)
+        final_category, final_confidence = resolve_final_category(img, clothing_result, footwear_result)
         return {
             "success": True,
             "filename": file.filename,
@@ -640,7 +684,7 @@ async def process_clothing(request: ImageBase64Request):
         img_array = preprocess_image(img_focus.convert("RGB"))
         clothing_result = predict_category(img_array)
         footwear_result = predict_footwear_category(img_array)
-        final_category, final_confidence = resolve_final_category(clothing_result, footwear_result)
+        final_category, final_confidence = resolve_final_category(img_focus, clothing_result, footwear_result)
         loop = asyncio.get_event_loop()
         color_future = loop.run_in_executor(None, detect_color, img_focus)
         sub_type_future = None
@@ -674,7 +718,7 @@ async def remove_bg_base64(request: ImageBase64Request):
     try:
         image_data = base64.b64decode(request.image)
         img_input = Image.open(io.BytesIO(image_data)).convert("RGB")
-        fg_img = img_input.convert("RGBA")
+        fg_img, used_rembg = remove_background_image(img_input)
         grey_bg = Image.new("RGBA", fg_img.size, (176, 176, 176, 255))
         composite = Image.alpha_composite(grey_bg, fg_img)
         final_img = _downscale_for_speed(composite.convert("RGB"), MAX_RESPONSE_IMAGE_SIDE)
@@ -684,7 +728,8 @@ async def remove_bg_base64(request: ImageBase64Request):
         return {
             "success": True,
             "processed_image": processed_base64,
-            "bg_removed": False,
+            "bg_removed": True,
+            "bg_engine": "rembg" if used_rembg else "opencv_fallback",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
