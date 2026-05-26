@@ -242,7 +242,21 @@ def _extract_mask(img: Image.Image) -> np.ndarray:
     has_meaningful_alpha = transparent_ratio > 0.01 and opaque_ratio > 0.01
     if has_meaningful_alpha and np.count_nonzero(alpha > 50) > 0:
         return alpha > 50
-    return np.ones((arr.shape[0], arr.shape[1]), dtype=bool)
+    
+    # Fallback for solid light backgrounds
+    rgb_norm_full = arr[:, :, :3].astype(np.float32) / 255.0
+    hsv_full = cv2.cvtColor((rgb_norm_full * 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+    hsv_full[:, :, 0] = hsv_full[:, :, 0] / 179.0
+    hsv_full[:, :, 1] = hsv_full[:, :, 1] / 255.0
+    hsv_full[:, :, 2] = hsv_full[:, :, 2] / 255.0
+    bg_like = (hsv_full[:, :, 1] < 0.12) & (hsv_full[:, :, 2] > 0.88)
+    mask = ~bg_like
+    if np.count_nonzero(mask) < 100:
+        gray = np.mean(arr[:, :, :3].astype(np.float32), axis=2) / 255.0
+        mask = gray < 0.96
+        if np.count_nonzero(mask) < 100:
+            return np.ones((arr.shape[0], arr.shape[1]), dtype=bool)
+    return mask
 
 def _crop_to_foreground(img_rgba: Image.Image, pad_ratio: float = 0.06) -> Image.Image:
     arr = np.array(img_rgba.convert("RGBA"))
@@ -400,8 +414,16 @@ def refine_category_by_shape(img: Image.Image, ml_category: str) -> str:
         bottom_band_ratio = bottom_band_width / width
         pants_like = _is_pants_like(mask, y_min, y_max, x_min, x_max, height, width)
         bottomwear_profile = _has_bottomwear_profile(mask, y_min, y_max, x_min, x_max)
-        if ml_category == "Dresses" and (pants_like or bottomwear_profile):
-            return "Bottomwear"
+        
+        obj_aspect_ratio = height / width
+        
+        if ml_category == "Dresses":
+            if pants_like or bottomwear_profile:
+                return "Bottomwear"
+            if obj_aspect_ratio < 1.35:
+                # Topwear (like crop tops or blouses) are generally wider relative to their height than dresses
+                return "Topwear"
+                
         if ml_category == "Topwear" and (pants_like or bottomwear_profile) and height_ratio > 0.45:
             return "Bottomwear"
         if ml_category == "Bottomwear":
