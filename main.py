@@ -219,16 +219,25 @@ def resolve_final_category(img: Image.Image, clothing_result: dict, footwear_res
     # RULE 1: Pehle shape refinement kar lo
     refined_cat = refine_category_by_shape(img, clothing_result["category"])
 
-    # RULE 2: Agar Clothing model zyada confident hai, toh seedha clothing return karo
-    if clothing_conf > footwear_conf:
+    # RULE 2: Agar image kafi lambi hai (aspect > 1.25), toh wo pakka clothing hai (pants ya dresses)
+    if aspect_ratio > 1.25:
         return refined_cat, clothing_conf
 
-    # RULE 3: Agar image kafi lambi hai (aspect > 1.4), toh wo pants ya dresses hi hongi
-    if aspect_ratio > 1.4:
+    # RULE 3: Agar Clothing model bohot confident hai (>= 85%), toh seedha clothing return karo
+    if clothing_conf >= CLOTHING_OVERRIDE_CONF:
         return refined_cat, clothing_conf
 
-    # RULE 4: Agar Footwear ka confidence kapdon se zyada hai aur accha score hai
-    if footwear_conf > clothing_conf and footwear_conf > 60.0:
+    # RULE 4: Footwear tabhi return karo jab uska confidence kaafi zyada ho AND kapdon se clear margin se jeete
+    if footwear_conf >= FOOTWEAR_STRONG_CONF and footwear_conf > (clothing_conf + 10.0):
+        return FOOTWEAR_CATEGORY_NAME, footwear_conf
+
+    # RULE 5: Agar upar wala koi rule match nahi kiya, toh clothing ko thoda bias do
+    # Agar clothing ka score footwear se kafi close hai (15% ke andar), toh clothing hi hoga
+    if clothing_conf >= (footwear_conf - 15.0):
+        return refined_cat, clothing_conf
+
+    # Fallback to footwear if it's decently confident
+    if footwear_conf > 70.0:
         return FOOTWEAR_CATEGORY_NAME, footwear_conf
 
     # Default fallback
