@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 from PIL import Image
 import io
 import base64
@@ -216,31 +216,22 @@ def resolve_final_category(img: Image.Image, clothing_result: dict, footwear_res
     # DEBUG logs (Taki aap terminal mein dekh sakein kya ho raha hai)
     print(f"DEBUG: Footwear {footwear_conf}% | Clothing {clothing_conf}% | Aspect {aspect_ratio:.2f}")
 
-    # RULE 1: Pehle shape refinement kar lo
+    # RULE 1: Agar Footwear model confident hai (>60%) AUR image tall nahi hai, 
+    # toh wo pakka Footwear hi hai.
+    if footwear_conf > 60.0 and aspect_ratio < 1.2:
+        return FOOTWEAR_CATEGORY_NAME, footwear_conf
+
+    # RULE 2: Agar model confuse hai, toh shape refinement chalao
     refined_cat = refine_category_by_shape(img, clothing_result["category"])
 
-    # RULE 2: Agar image kafi lambi hai (aspect > 1.25), toh wo pakka clothing hai (pants ya dresses)
-    if aspect_ratio > 1.25:
+    # RULE 3: Agar image kafi lambi hai (Pants/Dress), toh footwear ko ignore karo
+    if aspect_ratio > 1.5 and footwear_conf < 90.0:
         return refined_cat, clothing_conf
 
-    # RULE 3: Agar Clothing model bohot confident hai (>= 85%), toh seedha clothing return karo
-    if clothing_conf >= CLOTHING_OVERRIDE_CONF:
-        return refined_cat, clothing_conf
-
-    # RULE 4: Footwear tabhi return karo jab uska confidence kaafi zyada ho AND kapdon se clear margin se jeete
-    if footwear_conf >= FOOTWEAR_STRONG_CONF and footwear_conf > (clothing_conf + 10.0):
+    # Default logic (Confidence based)
+    if footwear_conf > clothing_conf + 5.0:
         return FOOTWEAR_CATEGORY_NAME, footwear_conf
-
-    # RULE 5: Agar upar wala koi rule match nahi kiya, toh clothing ko thoda bias do
-    # Agar clothing ka score footwear se kafi close hai (15% ke andar), toh clothing hi hoga
-    if clothing_conf >= (footwear_conf - 15.0):
-        return refined_cat, clothing_conf
-
-    # Fallback to footwear if it's decently confident
-    if footwear_conf > 70.0:
-        return FOOTWEAR_CATEGORY_NAME, footwear_conf
-
-    # Default fallback
+        
     return refined_cat, clothing_conf
 
 def _extract_mask(img: Image.Image) -> np.ndarray:
