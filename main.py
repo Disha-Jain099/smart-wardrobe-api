@@ -1,4 +1,4 @@
-﻿import numpy as np
+import numpy as np
 from PIL import Image
 import io
 import base64
@@ -216,22 +216,22 @@ def resolve_final_category(img: Image.Image, clothing_result: dict, footwear_res
     # DEBUG logs (Taki aap terminal mein dekh sakein kya ho raha hai)
     print(f"DEBUG: Footwear {footwear_conf}% | Clothing {clothing_conf}% | Aspect {aspect_ratio:.2f}")
 
-    # RULE 1: Agar Footwear model confident hai (>60%) AUR image tall nahi hai, 
-    # toh wo pakka Footwear hi hai.
-    if footwear_conf > 60.0 and aspect_ratio < 1.2:
-        return FOOTWEAR_CATEGORY_NAME, footwear_conf
-
-    # RULE 2: Agar model confuse hai, toh shape refinement chalao
+    # RULE 1: Pehle shape refinement kar lo
     refined_cat = refine_category_by_shape(img, clothing_result["category"])
 
-    # RULE 3: Agar image kafi lambi hai (Pants/Dress), toh footwear ko ignore karo
-    if aspect_ratio > 1.5 and footwear_conf < 90.0:
+    # RULE 2: Agar Clothing model zyada confident hai, toh seedha clothing return karo
+    if clothing_conf > footwear_conf:
         return refined_cat, clothing_conf
 
-    # Default logic (Confidence based)
-    if footwear_conf > clothing_conf + 5.0:
+    # RULE 3: Agar image kafi lambi hai (aspect > 1.4), toh wo pants ya dresses hi hongi
+    if aspect_ratio > 1.4:
+        return refined_cat, clothing_conf
+
+    # RULE 4: Agar Footwear ka confidence kapdon se zyada hai aur accha score hai
+    if footwear_conf > clothing_conf and footwear_conf > 60.0:
         return FOOTWEAR_CATEGORY_NAME, footwear_conf
-        
+
+    # Default fallback
     return refined_cat, clothing_conf
 
 def _extract_mask(img: Image.Image) -> np.ndarray:
