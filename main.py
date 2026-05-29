@@ -222,7 +222,7 @@ def resolve_final_category(img: Image.Image, clothing_result: dict, footwear_res
         return FOOTWEAR_CATEGORY_NAME, footwear_conf
 
     # RULE 2: Agar model confuse hai, toh shape refinement chalao
-    refined_cat = refine_category_by_shape(img, clothing_result["category"])
+    refined_cat = refine_category_by_shape(img, clothing_result["category"], clothing_result.get("all_scores"))
 
     # RULE 3: Agar image kafi lambi hai (Pants/Dress), toh footwear ko ignore karo
     if aspect_ratio > 1.5 and footwear_conf < 90.0:
@@ -381,7 +381,7 @@ def _has_bottomwear_profile(mask, y_min, y_max, x_min, x_max):
     center_to_side = center_fill / side_fill
     return lower_fill_ratio < 0.74 and center_to_side < 0.82
 
-def refine_category_by_shape(img: Image.Image, ml_category: str) -> str:
+def refine_category_by_shape(img: Image.Image, ml_category: str, all_scores: dict | None = None) -> str:
     try:
         mask = _extract_mask(img)
         coords = np.column_stack(np.where(mask > 0))
@@ -416,12 +416,26 @@ def refine_category_by_shape(img: Image.Image, ml_category: str) -> str:
         bottomwear_profile = _has_bottomwear_profile(mask, y_min, y_max, x_min, x_max)
         
         obj_aspect_ratio = height / width
+        top_to_bottom_ratio = top_width / max(1, bot_width)
+        hem_to_shoulder_ratio = bottom_band_width / max(1, top_band_width)
+        dress_score = float((all_scores or {}).get("Dresses", 0.0))
+        topwear_score = float((all_scores or {}).get("Topwear", 0.0))
+        topwear_score_is_close = topwear_score >= 18.0 and (dress_score - topwear_score) <= 28.0
+        has_topwear_shape = (
+            height_ratio < 0.72
+            and obj_aspect_ratio < 1.95
+            and top_to_bottom_ratio > 0.72
+            and hem_to_shoulder_ratio < 1.18
+            and bottom_band_ratio < 0.92
+        )
         
         if ml_category == "Dresses":
             if pants_like or bottomwear_profile:
                 return "Bottomwear"
             if obj_aspect_ratio < 1.35:
                 # Topwear (like crop tops or blouses) are generally wider relative to their height than dresses
+                return "Topwear"
+            if has_topwear_shape and topwear_score_is_close:
                 return "Topwear"
                 
         if ml_category == "Topwear" and (pants_like or bottomwear_profile) and height_ratio > 0.45:
